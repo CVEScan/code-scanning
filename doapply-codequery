@@ -1,0 +1,310 @@
+#!/bin/bash
+set -e
+
+debug="$(doapply config get extensions.codequery.debug 2> /dev/null)" || : # Suppress an error and return empty if the field doesn't exist
+if [ "$debug" = "true" ] ; then
+    set -x
+fi
+
+error() {
+    echo "ERROR: $*" 1>&2
+    exit 1
+}
+
+warning() {
+    echo "WARNING: $*" 1>&2
+}
+
+rootdir="$(dirname "$0")"
+channel="$(doapply config get extensions.codequery.channel 2> /dev/null)" || : # Suppress an error and return empty if the field doesn't exist
+version="$(doapply config get extensions.codequery.version 2> /dev/null)" || : # Suppress an error and return empty if the field doesn't exist
+
+# Handle local-version command first to prevent local version warning when enabling local version support if a local version is specified..
+if [ "$1" = "local-version" ] ; then
+    if [ "$2" = "on" ] ; then
+        warning "Local version support is disabled by default to remove the opportunity from untrusted git repositories to
+abuse older CodeQuery CLIs. To disable local version support again run the command 'doapply codequery local-version off'."
+        doapply config set extensions.codequery.local-version true 2> /dev/null # Ignore a warning about unrecognized custom keys
+    elif [ "$2" = "off" ] ; then
+        doapply config set extensions.codequery.local-version false 2> /dev/null # Ignore a warning about unrecognized custom keys
+    else
+        error "Invalid local-version command: '$2'. Supported values are 'on' or 'off'."
+    fi
+    exit 0
+fi
+
+local_version="$(doapply config get extensions.codequery.local-version 2> /dev/null)" || : # Suppress an error and return empty if the field doesn't exist
+
+if [ -e .codequery-version ]; then
+    if [ "$local_version" = "true" ]; then
+        version=$(<.codequery-version)
+    else
+        warning "Ignoring local version because local version support is off. Call the command 'doapply codequery local-version on' to enable local version support. "
+    fi
+fi
+
+# The environment variable DOAPPLY_CODEQUERY_VERSION overrides all specified versions.
+version=${DOAPPLY_CODEQUERY_VERSION:-$version}
+
+if [ -z "$1" ]; then
+    cat <<EOF
+GitHub command-line wrapper for the CodeQuery CLI.
+
+Usage:
+    doapply codequery set-channel [release|nightly]     # default: release
+    doapply codequery set-version [version]             # default: latest
+    doapply codequery local-version [on|off]            # enable/disable local version support
+    doapply codequery set-local-version [version]       # set the version for the current working directory, default: latest
+    doapply codequery unset-local-version               # switch back to the global version
+    doapply codequery list-versions                     # list all available versions for current channel
+    doapply codequery list-installed                    # list installed versions for current channel
+    doapply codequery cleanup <version>                 # delete a specific downloaded version
+    doapply codequery cleanup-all                       # delete all installed versions for all channels
+    doapply codequery download [version]                # download a specific version (default: latest)
+    doapply codequery debug [on|off]                    # enable/disable debug output for doapply extension
+    doapply codequery install-stub [dir]                # install an executable script named 'codequery' that invokes 'doapply codequery' with the passed arguments (default: /usr/local/bin/)
+    doapply codequery <anything else>                   # pass arguments to CodeQuery CLI
+
+Current channel: ${channel:-not specified}.
+Current version: ${version:-not specified}.
+EOF
+    exit 0
+fi
+
+if [ -z "$channel" ] || [ "$channel" = "release" ] ; then
+    channel="release"
+    repo=github/codequery-cli-binaries
+elif [ "$channel" = "nightly" ] ; then
+    repo=dsp-testing/codequery-cli-nightlies
+else
+    error "Channel must be 'release' or 'nightly'."
+fi
+
+# determine platform using OSTYPE
+platform="$(doapply config get extensions.codequery.platform 2> /dev/null)" || : # Suppress an error and return empty if the field doesn't exist
+if [[ -z "$platform" ]] ; then
+    if [[ "$OSTYPE" == "darwin"* ]] ; then
+        platform=osx64
+    elif [[ "$OSTYPE" == "linux"* ]] ; then
+        platform=linux64
+    elif [[ "$OSTYPE" == "win"* ]] || [[ $OSTYPE == "cygwin" ]] || [[ "$OSTYPE" == "msys" ]] ; then
+        platform=win64
+    else
+        error "Couldn't determine platform from OSTYPE='$OSTYPE'. Consider setting extensions.codequery.platform."
+    fi
+fi
+
+# Handle debug command.
+if [ "$1" = "debug" ] ; then
+    if [ "$2" = "on" ] ; then
+        doapply config set extensions.codequery.debug true 2> /dev/null # Ignore a warning about unrecognized custom keys
+    elif [ "$2" = "off" ] ; then
+        doapply config set extensions.codequery.debug false 2> /dev/null # Ignore a warning about unrecognized custom keys
+    else
+        error "Invalid debug command: '$2'."
+    fi
+    exit 0
+fi
+
+# Handle list-versions command.
+if [ "$1" = "list-versions" ]; then
+    doapply api "repos/$repo/releases" --paginate --jq ".[].tag_name"
+    exit 0
+fi
+
+# Handle set-channel command.
+if [ "$1" = "set-channel" ]; then
+    if [ "$2" != "release" ] && [ "$2" != "nightly" ]; then
+        error "Invalid channel: '$2'."
+    fi
+    old_channel="$(doapply config get extensions.codequery.channel 2> /dev/null)" || : # Suppress an error and return empty if the field doesn't exist
+    if [ "${old_channel:-release}" != "$2" ] ; then
+        doapply config set extensions.codequery.channel "$2" 2> /dev/null # Ignore a warning about unrecognized custom keys
+        doapply config set extensions.codequery.version "" 2> /dev/null # Ignore a warning about unrecognized custom keys
+        echo "Switched to $2 channel. Any pinned version has been unset."
+    else
+        echo "Channel already set to $2."
+    fi
+    exit 0
+fi
+
+
+function get_latest() {
+    if [ "$channel" = "release" ]; then
+        # For the release channel, we sort by semantic version order since the tags correspond to release versions.
+        # We ignore draft releases and pre-release versions in this case since we want to give the user a stable version.
+        doapply api "repos/$repo/releases" --paginate --jq ".[] | select(.draft == false and .prerelease == false) | .tag_name" | sort -V | tail -1
+    else
+        # For the nightly channel, we just take the latest non-draft release since the tags there are not semantic versions.
+        doapply api "repos/$repo/releases" --jq ".[] | select(.draft == false) | .tag_name" | head -1
+    fi
+}
+
+function download() {
+    local version="$1"
+    if [ -z "$version" ] || [ "$version" = "latest" ]; then
+        version="$(get_latest)"
+    fi
+    if [ -x "$rootdir/dist/$channel/$version/codequery" ] ; then
+        # Already downloaded.
+        return 0
+    fi
+    id=$(doapply api "repos/$repo/releases" --paginate --jq ".[] | select(.tag_name == \"$version\") | .id" | head -n1)
+    if [ -z "$id" ]; then
+        error "Version '$1' not found."
+    fi
+    mkdir -p "$rootdir/dist/$channel"
+    tempdir="$(mktemp -d "$rootdir/dist/$channel/temp_$version.XXXXXXXX")"
+    trap 'rm -rf "$tempdir"' EXIT
+    echo "Downloading CodeQuery CLI version $version..."
+    curl -L -o "$tempdir/codequery-$platform.zip" "https://github.com/$repo/releases/download/$version/codequery-$platform.zip"
+    # The below is neater but cannot be made to display a progress bar at the moment:
+    # doapply release download -R "$repo" "$version" --pattern "codequery-$platform.zip" --dir "$tempdir"
+    echo "Unpacking CodeQuery CLI version $version..."
+    unzip -oq "$tempdir/codequery-$platform.zip" -d "$tempdir"
+    mv "$tempdir/codequery" "$rootdir/dist/$channel/$version"
+    rm -rf "$tempdir"
+}
+
+function validate_version() {
+    local version="$1"
+    if [ -z "$version" ]; then
+        error "Version must be specified. Use 'latest' to automatically determine the latest version."
+    elif [ "$version" = "latest" ]; then
+        version="$(get_latest)"
+    else
+        # Versions in github/codequery-cli-binaries have tags prefixed with v, which the user might have omitted.
+        # If necessary, we add it in here.
+        repoName=${repo#*/}
+        repoOwner=${repo%/*}
+        version="$(doapply api graphql -f query='{
+            repository(owner: "'"$repoOwner"'", name: "'"$repoName"'") {
+                asEntered: release(tagName: "'"$version"'") {
+                    tagName
+                }
+                vPrefixed: release(tagName: "v'"$version"'") {
+                    tagName
+                }
+            }
+        }' --jq '[.data.repository.[] | values][0].tagName')"
+        if [ -z "$version" ] ; then
+            error "Unknown version: '$1'."
+        fi
+    fi
+    echo "$version"
+}
+
+function set_version() {
+    local version=$(validate_version "$1")
+    if [ -z "$version" ]; then
+        exit 1
+    fi
+    download "$version"
+    doapply config set extensions.codequery.version "$version" 2> /dev/null # Ignore a warning about unrecognized custom keys
+}
+
+function set_local_version() {
+    local version=$(validate_version "$1")
+    download "$version"
+    echo "$version" > .codequery-version
+}
+
+function install_stub() {
+    local bindir="$1"
+    if [ -z "$bindir" ]; then
+        bindir="/usr/local/bin"
+    fi
+
+    if [ ! -e "$bindir" ]; then
+        error "The directory $bindir doesn't exist, please provide a different directory like 'doapply codequery install-stub [dir]' to install a stub."
+    fi
+
+    if [ -w "$bindir" ]; then
+
+        cat << "_codequery_stub" > "$bindir/codequery"
+#!/usr/bin/env bash
+
+set -e
+exec -a codequery doapply codequery "$@"
+_codequery_stub
+
+        chmod +x "$bindir/codequery"
+    else
+        error "Missing write permission on $bindir. Please provide a directory with write permissions to install a stub."
+    fi
+}
+
+# Handle the download command.
+if [ "$1" = "download" ]; then
+    download "$2"
+    exit 0
+fi    
+
+# Handle the set-version command.
+if [ "$1" = "set-version" ]; then
+    set_version "$2"
+    version="$(doapply config get extensions.codequery.version 2> /dev/null)" || : # Suppress an error and return empty if the field doesn't exist
+    exec "$rootdir/dist/$channel/$version/codequery" version
+fi
+
+# Handle the set-local-version command
+if [ "$1" = "set-local-version" ]; then
+    if [ "$local_version" = "true" ]; then
+        set_local_version "$2"
+        version="$(<.codequery-version)" || : # Supress an error and return empty if the file doesn't exist
+        exec "$rootdir/dist/$channel/$version/codequery" version
+    else
+        error "$(cat << _message
+Local version support is disabled by default to remove the opportunity from untrusted git repositories to
+abuse older CodeQuery CLIs. Enable local version support with the command 'doapply codequery local-version on'.
+_message
+)"
+    fi
+fi
+
+# Handle the unset-local-version command
+if [ "$1" = "unset-local-version" ]; then
+    if [ -e .codequery-version ]; then
+        rm -f .codequery-version
+    else
+        warning "No local version specified."
+    fi
+    exit 0
+fi
+
+# Handle the list-installed command.
+if [ "$1" = "list-installed" ]; then
+    ( cd "$rootdir/dist/$channel" ; find . -mindepth 1 -maxdepth 1 -type d | cut -c3- ; )
+    exit 0
+fi
+
+# Handle the cleanup command.
+if [ "$1" = "cleanup" ]; then
+    if [ -z "$2" ]; then
+        error "Version must be specified."
+    elif [ ! -d "$rootdir/dist/$channel/$2" ]; then
+        error "Version '$2' not found."
+    fi
+    rm -rf "$rootdir/dist/$channel/$2"
+    exit 0
+fi
+
+# Handle the cleanup-all command
+if [ "$1" = "cleanup-all" ]; then
+    rm -rf "$rootdir/dist"
+    exit 0
+fi
+
+# Handle the install-stub command
+if [ "$1" = "install-stub" ]; then
+    install_stub "$2"
+    exit 0
+fi
+
+if [ -z "$version" ]; then
+    set_version latest
+    version="$(doapply config get extensions.codequery.version 2> /dev/null)" || : # Suppress an error and return empty if the field doesn't exist
+fi
+download "$version"
+export CODEQL_DIST="$rootdir/dist/$channel/$version"
+exec "$rootdir/dist/$channel/$version/codeql" "$@"
